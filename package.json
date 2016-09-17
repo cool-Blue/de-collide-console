@@ -1,0 +1,27 @@
+{
+  "name": "de-collide-console",
+  "version": "1.0.0",
+  "description": "manage stdout and stderr so that they do not collide in the console",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cool-Blue/de-collide-console.git"
+  },
+  "keywords": [
+    "stdout",
+    "stderr",
+    "interleave",
+    "buffer",
+    "queue",
+    "collisions"
+  ],
+  "author": "cool.blue@y7mail.com",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/cool-Blue/de-collide-console/issues"
+  },
+  "homepage": "https://github.com/cool-Blue/de-collide-console#readme"
+}
