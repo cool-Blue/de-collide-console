@@ -4,7 +4,8 @@
   "description": "manage stdout and stderr so that they do not collide in the console",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "test-build": "browserify -t brout test/de-collide-console-spec.js > test/bundle.js"
   },
   "repository": {
     "type": "git",
@@ -28,5 +29,8 @@
     "chai": "^3.5.0",
     "chai-as-promised": "^5.3.0",
     "mocha": "^3.0.2"
+  },
+  "dependencies": {
+    "brout": "^1.1.1"
   }
 }
