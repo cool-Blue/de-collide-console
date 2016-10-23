@@ -4,25 +4,40 @@
 'use strict';
 const chai = require('chai');
 const expect = chai.expect;
-const Decollide = require('../');
+var Decollide = require('../');
 const fs = require('fs');
 const path = require('path');
+const util = require('util');
 
 var log = (function(wrapperSelector) {
   var _basePath = path.normalize(__dirname + '\\..');
+  var _traceFlag = false;
 
   function _header (message) {
   return `\n*********************************************************************************************\n${message}\n*********************************************************************************************\n`;
 }
 
   function _trace (basePath) {
-    var stack = (new Error()).stack;
-    if (stack) {
-      return stack.split('\n').filter(l =>
-          l.includes(basePath) && !l.includes("node_modules")
-        ).slice(2)
-          .map(l => l.replace(basePath, ""))
-          .join("\n") + "\n";
+    try {
+      throw new Error();
+    } catch (e) {
+      var stack = e.stack;
+      if (stack) {
+        return stack.split('\n').filter(l =>
+            l.includes(basePath) && !l.includes("node_modules")
+          ).slice(2)
+            .map(l => l.replace(basePath, ""))
+            .join("\n") + "\n";
+      }
+    }
+  }
+
+  function _accessTraceFlag (f) {
+    if ( typeof f === 'undefined' )
+      return _traceFlag;
+    else{
+      _traceFlag = f;
+      return this
     }
   }
 
@@ -34,10 +49,12 @@ var log = (function(wrapperSelector) {
     var logStream = fs.createWriteStream('log.txt');
     return {
       write: (message) =>
-        logStream.write(`${_trim(message)}${_trim(_trace(_basePath))}`),
+        logStream.write(`${_trim(message)}${_traceFlag ? _trim(_trace(_basePath)) :""}`),
       header: function (message) {
         this.write(`${_header(message)}`)
-      }
+        return this;
+      },
+      trace: _accessTraceFlag
     }
   }
   else {
@@ -47,7 +64,7 @@ var log = (function(wrapperSelector) {
     logDiv.outerHTML =
       `<div id="log-wrapper" style= "margin: 10px; cursor: pointer;">
             <h1>Log Output</h1>
-            <div id="log-panel" style="white-space: pre; display: none; overflow: scroll; height: 50%"><h2 id="log" "></h2></div>
+            <div id="log-panel" style="white-space: pre; display: none; overflow: scroll; height: 400px"><h2 id="log" "></h2></div>
         </div>`;
     logDiv = document.querySelector('#log');
     var logPanel = document.querySelector('#log-panel');
@@ -56,13 +73,18 @@ var log = (function(wrapperSelector) {
     h.addEventListener('click', e =>
       logPanel.style.display = logPanel.style.display === 'none' ? 'block' : 'none'
     );
+    logPanel.addEventListener('click', e =>
+      logPanel.style.display = logPanel.style.display === 'none' ? 'block' : 'none'
+    );
 
     return {
       write: (message) =>
-        logDiv.textContent += `${_trim(message)}${_trim(_trace(""))}`,
+        logDiv.textContent += `${_trim(message)}${_trim(_traceFlag ? _trace("") : "")}`,
       header: function (message) {
-        this.write(`${_header(message)}`)
-      }
+        this.write(`${_header(message)}`);
+        return this;
+      },
+      trace: _accessTraceFlag
     }
   }
 })('#mocha');
@@ -83,9 +105,8 @@ var hooks = (function() {
 })();
 
 /**
- * get the elapsed time in ms
- * @returns {function()}
- * @constructor
+ * Isomorphic constructor for a timer to return
+ * the elapsed time between calls in ms
  */
 function Elapsed () {
 
@@ -103,9 +124,43 @@ function Elapsed () {
 }
 
 describe('deMUX', function () {
+  function errorHarness(dcOptions, writeOptions, onError, output, done) {
+    var lines = [];
+    var errorCalback;
+
+    process.stderr.write = function (line, cb) {
+      if (line === writeOptions.throwOn) {
+        writeOptions.onThrown(cb);
+      }
+      else {
+        log.write(`proxy write: ${line}`);
+        lines.push(line);
+        cb();
+      }
+    };
+
+    new Decollide(dcOptions);
+
+    Decollide.on('error', errorCalback = onError(lines));
+
+    Decollide.on('drain', (e, v) => {
+
+      Decollide.unhook();
+
+      hooks.restore();
+
+      log.write(`drain listener: last value: ${v}\terrors: ${util.inspect(e)}\noutput: ${util.inspect(lines)}`);
+
+      expect(lines).to.eql(output);
+      expect(Decollide._values().length).to.eql(0);
+
+      done();
+    })
+  }
 
   beforeEach(function () {
     hooks.save();
+    Decollide = require('../');
   });
   afterEach(function () {
     hooks.restore();
@@ -115,27 +170,26 @@ describe('deMUX', function () {
 
   it('should throw if hooked again', function () {
 
-    log.header(`${this.test.title}`);
-
-    new Decollide(delay, log);
-    expect(() => new Decollide(delay, log)).to.throw(Decollide.errors.InstantiationError)
+    new Decollide(delay);
+    expect(() => new Decollide(delay)).to.throw(Decollide.errors.InstantiationError)
 
   });
   it('should restore standard writes', function (done) {
-    var writes = [];
-    var writeHooks = [];
-    var linesReceived = [];
-    var toSend = {log: 'log-log', err: 'log-error'};
 
     log.header(`${this.test.title}`);
+    var writes = [];
+    var writeHooks = [];
+    var lines = [];
+    var toSend = {log: 'log-log', err: 'log-error'};
 
     // hook stdout and stderr
     // store their original write methods in writes[]
-    // and redirect writes to push linesReceived[]
+    // and redirect writes to push lines[]
     // store the redirect methods in writeHooks[]
-    var _writeHook = _ => {
-      linesReceived.push(_)
+    var _writeHook = (_) => {
+      lines.push(_.replace(/\n$/, ""));
     };
+    // var _writeHook = WriteHook(lines);
     ['stdout', 'stderr'].forEach(chanel => {
       writes.push(process[chanel].write);
       process[chanel].write = _writeHook;
@@ -144,10 +198,10 @@ describe('deMUX', function () {
 
     // establish the regulated queue on both channels, write
     // to them and listen for the drain events
-    new Decollide(delay, log);
+    new Decollide({t: delay});
     console.log(toSend.log);
     console.error(toSend.err);
-    Decollide.on('drain', function (value, source) {
+    Decollide.on('drain', function (e, v) {
       // restore the test hooks
       Decollide.unhook();
       var outWrite = process.stdout.write;
@@ -156,72 +210,78 @@ describe('deMUX', function () {
       // resume normal transmission
       hooks.restore();
 
+      log.write(`drain listener: last value: ${v}\terrors: ${util.inspect(e)}\noutput: ${util.inspect(lines)}`);
+
       // confirm that the hooks worked
-      expect(linesReceived[0]).to.include(toSend.log);
-      expect(linesReceived[1]).to.include(toSend.err);
+      expect(lines[0]).to.equal(toSend.log);
+      expect(lines[1]).to.equal(toSend.err);
       // check that the test hooks were restored
       expect(outWrite).to.equal(_writeHook);
       expect(errWrite).to.equal(_writeHook);
-      log.write(`${value} ${source}`);
       done();
     });
 
   });
   it('should preserve the order of output and step with delay', function (done) {
 
-    var elapsed = Elapsed();
-    var elapsedTime = Elapsed();
-
-    var trace = [];
-
     log.header(`${this.test.title}`);
 
-    var template = [1,2,3,4,5,6,7,8,9],
-      messages = [];
-    template.forEach(_ => {
-      messages.push('log:' + _);
-      messages.push('error:' + _)
+    // make an array of messages tagged with alternating log and error prefixes
+    var lines = [];
+    [1, 2, 3, 4, 5, 6, 7, 8, 9].forEach(_ => {
+      lines.push('log:' + _);
+      lines.push('error:' + _)
     });
-    function* checkSeq (outputs, steps, writing) {
+
+    // returns a state machine that will yield the next value of the outputs
+    // array and the elapsed time since the previous call.
+    // it will complete when called with writing === falsey
+    function* checkSeq(outputs, writing) {
 
       var elapsedTime = Elapsed();
 
       var i = 0, line;
       line = yield;
-      while(writing()) {
-        line = yield steps[steps.push(
-          {line: outputs[i], dt: elapsedTime(), i: i++}
-        ) -1]
+      while (writing()) {
+        line = yield {line: outputs[i], dt: elapsedTime(), i: i++}
       }
+
     }
 
-    // test hooks
+    // test hooks to receive the marshaled messages
+    // get the next message in the
     process.stdout.write = process.stderr.write = function (line) {
       var state = seq.next(line);
+      log.trace(false).write(util.inspect(state).replace('\n', ''));
       if (state.done) return;
       expect(line).to.equal(state.value.line + '\n');
-      if (state.value.i)
+      if (  state.value.i ) {
         expect(state.value.dt).to.be.within(0.9 * delay, 1.5 * delay);
+      }
     };
 
-    new Decollide(delay, log);
+    new Decollide({t: delay, skip: false});
 
-    var steps = [];
-    var seq = checkSeq(messages, steps, Decollide.writing.bind(Decollide));
+    // set an error listener for the queue
+    Decollide.on('error', (e, _) => {
+      process.stdout.write(`${e}\t${_}`)
+    });
+
+    var seq = checkSeq(lines, Decollide.writing.bind(Decollide));
 
     seq.next();
 
-    messages.forEach(_ => {
-      trace.push(elapsedTime() + '\t' + _);
-      console[_.substring(0, _.indexOf(':'))](_);
+    // write to console.log and console.error depending on the message prefix
+    lines.forEach((_) => {
+      console[_.substring(0, _.indexOf(':'))](_);  // decode and write too
     });
-    trace.push(elapsed() + '\t' + 'written');
-    Decollide.on('drain', function (value, source) {
-      trace.push(elapsed() + '\t' + 'drained');
+    Decollide.on('drain', function (e, v) {
       Decollide.unhook();
       hooks.restore();
-      log.write(`unhooked ${value} ${source}`);
-      trace.push(elapsed() + '\t' + 'reverted');
+
+      log.write(`drain listener: last value: ${v}\terrors: ${util.inspect(e)}\noutput: ${util.inspect(lines)}`);
+
+      if (e && e instanceof Error) throw(e);
       done();
     });
 
@@ -230,9 +290,9 @@ describe('deMUX', function () {
 
     log.header(`${this.test.title}`);
 
-    var linesReceived = [];
+    var lines = [];
     var _writeHook = (_, cb) => {
-      linesReceived.push(_);
+      lines.push(_);
       cb()
     };
     ['stdout', 'stderr'].forEach(chanel => {
@@ -242,7 +302,7 @@ describe('deMUX', function () {
     var cb = (function () {
       var calls = 0;
       var f = function (chunk) {
-        log.write(chunk);
+        log.trace(false).write(chunk);
         return calls++
       };
       f.calls = function () {
@@ -250,27 +310,30 @@ describe('deMUX', function () {
       };
       return f;
     })();
-    new Decollide(1000, log);
+    new Decollide({t: 1000});
     var cbCount;
-    Decollide.on('drain', function (value, source) {
+    Decollide.on('drain', function (e, v) {
+      
       Decollide.unhook();
       hooks.restore();
 
+      log.write(`drain listener: last value: ${v}\terrors: ${util.inspect(e)}\noutput: ${util.inspect(lines)}`);
+
       expect((cbCount = cb.calls())).to.equal(2);
 
-      log.write(`unhooked ${value} ${source} ${cbCount}`);
       done();
     });
-    log.write("about to write");
     process.stdout.write('stdout\n', cb);
     process.stderr.write('stderr\n', cb);
 
   });
   it('should honour callback for three arg signature', function (done) {
 
-    var linesReceived = [];
+    log.header(`${this.test.title}`);
+
+    var lines = [];
     var _writeHook = (_, enc, cb) => {
-      linesReceived.push(_);
+      lines.push(_);
       cb()
     };
     ['stdout', 'stderr'].forEach(chanel => {
@@ -280,7 +343,6 @@ describe('deMUX', function () {
     var cb = (function () {
       var calls = 0;
       var f = function (chunk) {
-        log.write(chunk);
         return calls++
       };
       f.calls = function () {
@@ -289,21 +351,20 @@ describe('deMUX', function () {
       return f;
     })();
 
-    log.header(`${this.test.title}`);
-
-    new Decollide(1000, log);
+    new Decollide({t: 1000});
     var cbCount;
-    Decollide.on('drain', function (value, source) {
+    Decollide.on('drain', function (e, v) {
+
       Decollide.unhook();
 
       hooks.restore();
 
+      log.write(`drain listener: last value: ${v}\terrors: ${util.inspect(e)}\noutput: ${util.inspect(lines)}`);
+
       expect((cbCount = cb.calls())).to.equal(2);
 
-      log.write(`unhooked ${value} ${source} ${cbCount}`);
       done();
     });
-    log.write("about to write");
     process.stdout.write('stdout\n', 'utf8', cb);
     process.stderr.write('stderr\n', 'utf8', cb);
 
@@ -315,35 +376,149 @@ describe('deMUX', function () {
 
     log.header(`${this.test.title}`);
 
-    new Decollide(100);
+    new Decollide({t: 100});
     Decollide.timeout(0);
     process.stderr.write('should throw', _ => _);
-    Decollide.on('error', function (e) {
+    Decollide.on('error', function (e, v) {
       Decollide.unhook();
 
       hooks.restore();
 
+      log.write(v);
+
       expect(e).to.be.an.instanceof(Decollide.errors.WriteTimeoutError);
-      
-      done();
+
+      // done();
     });
+    Decollide.on('drain', (e, v) => {
+
+      Decollide.unhook();
+
+      hooks.restore();
+
+      log.write(`drain listener: last value: ${v}\terrors: ${util.inspect(e)}`);
+
+      done();
+    })
+
   });
-  it('should throw on stream errors', function (done) {
-    new Decollide(delay);
+  it('should emit write timeout error then continue if skip === true and not leak memory', function (done) {
 
     log.header(`${this.test.title}`);
 
-    Decollide.on('error', function (e) {
-      Decollide.unhook();
+    errorHarness({t: 100, timeout: 100, skip: true/*, logger: log*/},
+      {throwOn: "log:5", onThrown: cb => setTimeout(cb, 1000)},
+      () => {
+        return function (e, v) {
+          log.write(`${v}\t${e.message}`);
+        }
+      },
+      [1, 2, 3, 4, 6, 7, 8, 9].map(_ => 'log:' + _),
+      done);
 
-      hooks.restore();
-
-      expect(e.message).to.equal('test error');
-
-      done();
+    [1, 2, 3, 4, 5, 6, 7, 8, 9].forEach(_ => {
+      process.stderr.write('log:' + _, _ => _);
     });
-    process.stderr.write('should throw', _ => _);
-    process.stderr.emit('error', new Error('test error'))
-  })
+
+  });
+  it('should emit write timeout error then abort if skip === false and not leak memory', function (done) {
+
+    log.header(`${this.test.title}`)//.trace(true);
+
+    errorHarness({t: 100, timeout: 100, skip: false/*, logger: log*/},
+      {throwOn: "log:5", onThrown: cb => setTimeout(cb, 1000)},
+      () => {
+        return function (e, v) {
+          log.write(`${v}\t${e.message}`);
+        }
+      },
+      [1, 2, 3, 4].map(_ => 'log:' + _),
+      done);
+
+    [1, 2, 3, 4, 5, 6, 7, 8, 9].forEach(_ => {
+      process.stderr.write('log:' + _, _ => _);
+    });
+
+  });
+  it('should throw on stream errors when skip === false and not leak memory', function (done) {
+
+    log.header(`${this.test.title}`)/*.trace(true)*/;
+
+    errorHarness(
+      {t: 500, skip: false/*, logger: log*/}, {},
+      function (lines) {
+        return function (e) {
+
+        Decollide.unhook();
+
+        hooks.restore();
+
+        log.write(`error listener ${util.inspect(e)}\n${util.inspect(lines)}`);
+
+        expect(e.message).to.equal('test error');
+
+      }},
+      ['log:1', 'log:2', 'log:3', 'log:4', 'log:5'],
+      done);
+
+    [1, 2, 3, 4, 5, 6, 7, 8, 9].forEach(_ => {
+      process.stderr.write('log:' + _, _ => _);
+    });
+
+    setTimeout(() => {
+      process.stderr.emit('error', new Error('test error'));
+    }, 3000);
+
+  });
+  it('should throw on stream errors when skip === true and not leak memory', function (done) {
+
+    log.header(`${this.test.title}`)/*.trace(true)*/;
+
+    errorHarness(
+      {t: 500, skip: true/*, logger: log*/}, {},
+      function (lines) {
+        return function (e) {
+
+          Decollide.unhook();
+
+          hooks.restore();
+
+          log.write(`error listener ${util.inspect(e)}\n${util.inspect(lines)}`);
+
+          expect(e.message).to.equal('test error');
+
+        }},
+      [1, 2, 3, 4, 5, 6, 7, 8, 9].map(_ => 'log:' + _),
+      done);
+
+    [1, 2, 3, 4, 5, 6, 7, 8, 9].forEach(_ => {
+      process.stderr.write('log:' + _, _ => _);
+    });
+
+    setTimeout(() => {
+      process.stderr.emit('error', new Error('test error'));
+    }, 3000);
+
+  });
+  it('should emit write error then continue if skip === true and not leak memory', function (done) {
+
+    log.header(`${this.test.title}`);
+
+    errorHarness({t: 100, timeout: 100, skip: true/*, logger: log*/},
+      {throwOn: "log:5", onThrown: cb => {throw new Error('random')}},
+      () => {
+        return function (e, v) {
+          log.write(`${v}\t${e.message}`);
+        }
+      },
+      [1, 2, 3, 4, 6, 7, 8, 9].map(_ => 'log:' + _),
+      done);
+
+    [1, 2, 3, 4, 5, 6, 7, 8, 9].forEach(_ => {
+      process.stderr.write('log:' + _, _ => _);
+    });
+
+  });
+
 });
 

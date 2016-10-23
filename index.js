@@ -1,234 +1,265 @@
 /**
+ * Copyright (c) 2016 cool.blue@y7mail.com
  * Created by cool.blue on 17-Sep-16.
- *
  */
 'use strict';
 const EventEmitter = require('events');
 const util = require('util');
 
-var log;
 
-class InstantiationError extends Error {
-  constructor (message) {
-    super(message);
+var errors = (function () {
+
+  class InstantiationError extends Error {
+    constructor (message) {
+      super(message);
+    }
   }
-}
 
-class WriteTimeoutError extends Error {
-  constructor (message) {
-    super(message);
+  class WriteTimeoutError extends Error {
+    constructor (message) {
+      super(message);
+    }
   }
-}
 
-var errors = {
-  InstantiationError,
-  WriteTimeoutError
-};
+  class StreamError extends Error {
+    constructor (message) {
+      super(message);
+    }
+  }
+
+  return {
+    InstantiationError,
+    WriteTimeoutError,
+    StreamError
+  }
+
+})();
+
+var log = {write: _ => _};
 
 /**
- * <h3>Multiplex stdout and stderr into a shift register</h3>
- * @constructor
- * @event drain
- * @argument t {number}
+ * Marshal hooked streams into a clocked stream with strictly preserved
+ * chronology.
  */
 module.exports = (function () {
 
-  /**
+  /****************************************************************************
    * Private static fields
-   **/
+   ****************************************************************************/
 
-  var Queue = (function () {
-    var _m = [];
+  var /** State */ _Queue = (function () {
+
+    /**************************************************************************
+     * Private static members
+     **************************************************************************/
+
+    var /** (string|buffer)[] */ _m = [];
+    var /** Object[] */ _errors = [];
+
+    function _thrown () {
+      return !!_errors.length && _errors[_errors.length -1];
+    }
+
     /**
-     * This object manages an array to mirror the promise queue
-     * and to provide a drain event
-     * @class Queue
-     * @param skip
+     * Manages an array to mirror the promise queue
+     * @emit drain
      */
-    return class state extends EventEmitter {
-      /**
-       * @constructor
-       * @param skip - skip errors if truthy
-       */
-      constructor(skip) {
+    return class State extends EventEmitter {
+
+      constructor(options) {
+        options = options || {};
         super();
-        this.skipErrors = skip;
-        this.thrown = false;
+        this.skipErrors = !!options.skip;
+        _errors = [];
       }
 
-      /**
-       * record a reference to the next queue member
-       * @public
-       * @param _
-       * @returns {Number}
-       */
-      static push(_) {
-        log.write(`push ${_}`);
-        return _m.push(_);
-      }
-
-      /**
-       * consume the oldest queue member
-       * @public
-       * @emits drain
-       * @returns {*}
-       */
-      pop(source) {
+      // consume the oldest queue member and emit drain events
+      // log errors
+      pop(e) {
         var r = _m.shift();
-        log.write(`popped ${r} ${util.inspect(source)}\n${util.inspect(_m)}`);
+        if ( e )
+          _errors.push({at: _m.length, value: r, error: e, thrown: false});
         if ( !_m.length ){
-          process.nextTick(() => {
-            log.write(`state: emitting drain ${r} ${util.inspect(source)} ${util.inspect(_m)}`);
-            source.source += "::pop";
-            this.emit('drain', r, source)
-          });
+          process.nextTick( () => {
+            log.write(`emit drain ${r} ${util.inspect(_m)}`);
+            this.emit('drain', _errors, r)
+          } );
         }
         return r
       }
+      skip () {
+        var e;
+        if (e = _thrown()) {
+          log.write(`_delay : thrown ${util.inspect(e)}`);
+          if (!e.thrown) {
+            e.thrown = true;
+          }
+          return !this.skipErrors
+        }
+        return false;
+      }
+      error (e) {
+        _errors.push({at: _m.length, error: e, thrown: false})
+      }
+
+      // record a reference to the next queue member
+      static push(_) {
+        return _m.push(_);
+      }
+
       static length () {
         return _m.length;
       }
       static values () {
         return _m;
       }
-      abort (e) {
-        this.thrown = e;
-      }
     }
   })();
 
-  var _ee;
+  // Exposed on the public static interface to provide a static event emitter
+  var /** EventEmitter */ _ee;
 
-  var _tail;
-  var _queueMembers;
-  var _t;
+  /** Promise chain management */
+
+  // called by the last promise in the chain
+  var /** Promise */ _tail;
+  // mirrors the state of the promise chain
+  var /** State */ _queueState;
+  // sets the delay between writes to stdout and stderr
+  var /** number */ _t;
 
   var _timeout = 1000;
 
-  /**
+  /****************************************************************************
    * Private static methods
-   **/
+   ****************************************************************************/
 
   /**
-   * delay element for padding the promise queue
+   * delay element for padding and organising the promise queue
    * resolves after the specified time or rejects immediately on error
-   * @param t
-   * @returns {Promise}
-   * @private
+   * if an error occurs during the wait time, reject after time-out
    */
-  function _delay(t) {
-    return new Promise((res, rej) => {
-      var e;
-      if ( e = _queueMembers.thrown )
-        rej(e);
-      else
-        setTimeout(res, t)
+  function _delay(/** number */ t) {
+    return new Promise( (res, rej) => {
+      if ( _queueState.skip() )
+        rej();
+      log.write(`_delay : NOT thrown ${t}`);
+      setTimeout(() => {
+        if (_queueState.skip())
+          rej();
+        else
+          res()
+      }, t)
     })
   }
 
   /**
-   * <h3>insert a shift register in strm.write, with fixed gaps between writes</h3>
-   * @private
-   * @param {Socket} strm
-   * @returns {_hook}
+   * Buffer all hooked streams into a queue and emit the writes as a regularly
+   * spaced sequence, strictly preserving the original order.
    */
-  function _hook (strm) {
 
-      /**
-       * store the write method to be proxy'ed, but only once!
-       * this is closed over by
-       * @private {function}
-       */
-      var _write = strm.write;
-      if ( _write.name === __enQ.name )
-        throw( new InstantiationError(
-          `${{"1": "stdout", "2": "stderr"}[strm.fd]} is already hooked.`
-        ));
+  function _hook (/** Socket */ strm) {
 
-      /**
-       * proxy the stream write method with standard signature
-       */
+    /**
+     * store the write method to be proxy'ed, but only once!
+     * this is closed over by
+     */
+    var _write = strm.write;
+    if ( _write.name === __enQ.name )
+      throw( new errors.InstantiationError(
+        `${{"1": "stdout", "2": "stderr"}[strm.fd]} is already hooked.`
+      ));
 
-      /**
-       * Return a function that will resolve the promise after writing
-       * and maintain a watchdog timer that throws if the queue hangs
-       * Handle different possible call signatures for the write function
-       * @param chunk {string | buffer}
-       * @param enc {string}
-       * @param done  {function}
-       * @returns {Promise}
-       */
-      function promiseToWrite(chunk, enc, done) {
-        var dog;
-        return new Promise((res, rej) => {
+    // Proxy the stream write method with standard signatures
 
-          dog = setTimeout(
-            rej.bind(null, new WriteTimeoutError(`write timeout ${chunk}`)),
-            _timeout
-          );
+    /**
+     * Return a function that will resolve the promise after writing
+     * and maintain a watchdog timer that throws if the queue hangs
+     * Handle different possible call signatures for the write function
+     */
+    function promiseToWrite(chunk, enc, done) {
+      var /** long */ dog;
+      return new Promise((res, rej) => {
 
-          if ( typeof enc === 'function' )               // write(chunk, done)
-            _write.call(strm, chunk, () => {
-              enc(chunk);
-              res(chunk)
-            });
-          else if ( typeof done === 'function' )         // write(chunk, enc, done)
-            _write.call(strm, chunk, enc, () => {
-              done(chunk);
-              res(chunk)
-            });
-          else {
-            _write.call(strm, chunk, enc, done);      // unknown signature, assume sync
+        log.write(`promiseToWrite ${chunk}
+                    enc: ${util.inspect(enc)}
+                    done: ${util.inspect(done)}
+                    timeout: ${_timeout}`);
+
+        dog = setTimeout(
+          rej.bind(null, new errors.WriteTimeoutError(`write timeout ${chunk}`)),
+          _timeout
+        );
+
+        if (typeof enc === 'function')               // write(chunk, done)
+          _write.call(strm, chunk, () => {
+            log.write(`_write ${chunk}`);
+            enc(chunk);
             res(chunk)
-          }
-        }).then((chunk) => {
-          clearTimeout(dog);
-          return chunk
-        });             // timeout error will skip this
-      }
-
-      /**
-       * push a promise to write into the shift register
-       * @private
-       * @fires drain
-       * @param chunk {string | buffer}
-       * @param enc {string}
-       * @param done  {function}
-       */
-      function __enQ(chunk, enc, done) {
-
-        _tail = _tail
-          .then(() => _delay(_t))                      // can throw stream error
-          .then(() =>
-            promiseToWrite(chunk, enc, done)           // can throw timeout error
-              .then(
-                (chunk) =>
-                  _queueMembers.pop({source: "resolved", value: chunk})
-              )
-          )                                           // catch errors thrown by
-          .catch(e => {                               // delay and promiseToWrite
-            this.__unhook();
-            _queueMembers.pop({source: "reject", value: e});
-            _ee.emit('error', e, chunk)
           });
-        Queue.push(chunk);                            // mirror the value in the queue
-      }
-
-      strm.write = __enQ;
-      strm.__unhook = () => strm.write = _write;
-
-      if ( typeof strm.on === 'undefined' ) {
-        let ee = new EventEmitter();
-        strm.on = (e, l) => ee.on.call(strm, e, l);
-        strm.emit = (type, e) => ee.emit.call(strm, type, e);
-      }
-      strm.on('error', e => {
-        _queueMembers.abort(e)
-      });
-
-      return _hook;
-
+        else if (typeof done === 'function')         // write(chunk, enc, done)
+          _write.call(strm, chunk, enc, () => {
+            log.write(`_write ${chunk}`);
+            done(chunk);
+            res(chunk)
+          });
+        else {
+          _write.call(strm, chunk, enc, done);        // unknown signature, assume sync
+          res(chunk)
+        }
+      }).then((chunk) => {
+        clearTimeout(dog);
+        log.write(`promiseToWrite clear ${chunk}`);
+        return chunk
+      });                                             // timeout error will skip this
     }
+
+    var onError = e => {
+      log.write(`stream error ${util.inspect(e)}`);
+      _ee.emit('error', e);
+      _queueState.error(e)
+    };
+    
+    // shim brout a little closer to node in the browser
+    if ( typeof strm.on === 'undefined' ) {
+      let ee = new EventEmitter();
+      strm.on = (e, l) => ee.on.call(strm, e, l);
+      strm.emit = (type, e) => ee.emit.call(strm, type, e);
+      strm.removeListener = (type, l) => ee.removeListener.call(strm, type, l);
+    }
+    strm.on('error', onError);
+
+    /**
+     * push a promise to write into the queue
+     */
+    function __enQ(chunk, enc, done) {
+
+      _tail = _tail
+        .then(() => _delay(_t))                      // can throw stream error
+        .then(() =>
+          promiseToWrite(chunk, enc, done)           // can throw timeout error
+            .then(
+              (chunk) =>
+                _queueState.pop()
+            )
+        )                                            // catch errors thrown by
+        .catch(e => {                                // delay and promiseToWrite
+          log.write(`catch ${e}`);
+          _queueState.pop(e);
+          if (e instanceof errors.WriteTimeoutError) _ee.emit('error', e, chunk);
+        });
+      _Queue.push(chunk);                            // mirror the value in the queue
+    }
+
+    __enQ.__unhook = () => {
+      strm.write = _write;
+      strm.removeListener('error', onError)
+    };
+    strm.write = __enQ;
+
+    return _hook;
+
+  }
 
   /**
    * Class with exclusively static methods and private, static state.
@@ -238,37 +269,35 @@ module.exports = (function () {
    */
   return class DeCollide {
 
-    constructor (t, logFile) {
+    constructor (options) {
+
+      options = options || {};
+
+      log = options.logger || log;
+
+      _timeout = options.timeout || _timeout;
 
       _ee = new EventEmitter();
 
-      log = logFile || {write: () => {}};
-
-      _queueMembers = new Queue();
+      _queueState = new _Queue({skip: !!options.skip});
       _tail = Promise.resolve();
 
-      /**
-       * shift out delay
-       * @type {number}
-       * @private
-       */
-      _t = typeof t === 'undefined' ? 100 : t;
+      // shift out delay
+      _t = typeof options.t === 'undefined' ? 100 : options.t;
 
       // pass the drain event on to the consumer un-handled
-      _queueMembers.on('drain', (v, s) => {
-        log.write(`DeCollide: emitting drain ${v} ${util.inspect(s)}`);
-        s.source += "::_queueMembers.onDrain";
-        process.nextTick(() => DeCollide.emit('drain', v, util.inspect(s)));
+      _queueState.on('drain', (e, v) => {
+        process.nextTick(() => DeCollide.emit('drain', e, v));
       });
 
-      // bind stdout and stderr
+      // hook stdout and stderr
       _hook(process.stdout)(process.stderr);
 
     }
 
-    /**
+    /****************************************************************************
      * Public static interface
-     */
+     ****************************************************************************/
 
     // expose a static event emitter by binding to a private member
     static on() {
@@ -281,14 +310,14 @@ module.exports = (function () {
     }
     // un-bind
     static unhook() {
-      process.stdout.__unhook();
-      process.stderr.__unhook();
+      process.stdout.write.__unhook && process.stdout.write.__unhook();
+      process.stderr.write.__unhook && process.stderr.write.__unhook();
     };
     // expose queue state
-    static Length () { return Queue.length };
+    static Length () { return _Queue.length };
     static tail () { return _tail };
-    static writing (){ return !!Queue.length };
-    static _values () { return Queue.values() };
+    static writing (){ return !!_Queue.length };
+    static _values () { return _Queue.values() };
     // accessor for write timeout
     static timeout(t) {
       if ( !(typeof t === 'undefined' ))
