@@ -12,11 +12,11 @@ A timeout is provided in the unlikely event that the the streams hang.  If this 
 Just add the following code...
 
 ```js
-var decollide = require('de-collide-console');
+var Decollide = require('de-collide-console');
 
-var q = decollide(10);
-q.on('drain' ,() => {
-  q.unhook();
+new Decollide(10);
+Decollide.on('drain' ,() => {
+  Decollide.unhook();
 });
 ```
 
